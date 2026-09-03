@@ -1,0 +1,100 @@
+# ================================
+# Python
+# ================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ================================
+# Node / Frontend
+# ================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+.pnp.*
+
+# ================================
+# Environment / Secrets
+# ================================
+.env
+.env.local
+.env.production
+*.secret
+*.key
+
+# ================================
+# Generated ML Model Artifacts
+# ================================
+models_artifacts/
+backend/models_artifacts/
+
+# ================================
+# Database
+# ================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ================================
+# Docker
+# ================================
+docker-compose.override.yml
+
+# ================================
+# IDE
+# ================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ================================
+# OS
+# ================================
+.DS_Store
+Thumbs.db
+
+# ================================
+# Uploads
+# ================================
+backend/uploads/
+uploads/
+
+# ================================
+# Logs
+# ================================
+*.log
+logs/
+
+# ================================
+# Testing / Coverage
+# ================================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ================================
+# Jupyter
+# ================================
+.ipynb_checkpoints/
+
+# ================================
+# Power BI
+# ================================
+*.pbix
+# Freebuff
+.freebuff/
+# Freebuff preview/log files
+*.freebuffpreview-*.log.err
