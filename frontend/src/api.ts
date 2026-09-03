@@ -1,5 +1,6 @@
-const API_BASE = 'http://localhost:8000/api/v1';
-const WS_BASE = 'ws://localhost:8000';
+// Production: use env vars. Dev fallback: localhost:8000 (via Vite proxy or direct)
+const API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8000/api/v1';
+const WS_BASE = (import.meta as any).env?.VITE_WS_URL || 'ws://localhost:8000';
 
 function authHeaders(): Record<string, string> {
   const token = localStorage.getItem('fraudlens_token');
