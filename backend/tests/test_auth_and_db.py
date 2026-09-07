@@ -17,7 +17,9 @@ isolation against a throwaway SQLite database (see ``conftest.py``).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
 
 import pytest
@@ -262,6 +264,118 @@ class TestProductionFailFast:
             s._init_engines()
             assert s._backend == "sqlite"
             assert s.engine.url.drivername == "sqlite+aiosqlite"
+        finally:
+            _restore_engine_globals(s)
+
+
+# --------------------------------------------------------------------------
+# Startup timeout guards (an unreachable DB must fail fast, not hang startup)
+# --------------------------------------------------------------------------
+
+# uvicorn runs the FastAPI lifespan *before* it binds the listen port, so a
+# startup that blocks forever on an unreachable PostgreSQL (suspended Neon
+# compute, firewall drop, TLS handshake hang) keeps the service in a
+# "no open ports" state and the platform reports a port-scan timeout instead
+# of the real error. The engine carries a bounded connect timeout and init_db
+# wraps its round-trip in a hard timeout; these tests pin both.
+
+
+class _HangingBeginEngine:
+    """Stand-in async engine whose begin() blocks longer than the init guard."""
+
+    def __init__(self, hang_seconds: float):
+        self._hang = hang_seconds
+        self.disposed = False
+
+    def begin(self):
+        return self
+
+    async def __aenter__(self):
+        await asyncio.sleep(self._hang)
+        raise AssertionError("connect should have been cancelled by the timeout guard")
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def dispose(self):
+        self.disposed = True
+
+
+class TestStartupTimeoutGuard:
+    def test_postgres_engine_gets_bounded_connect_timeout(self, monkeypatch):
+        """The asyncpg engine must be created with an explicit connect timeout
+        so a SYN-blackholed database host cannot block startup indefinitely."""
+        s = _import_db_session()
+        _patch_settings(monkeypatch, _StubSettings(debug=False, db_url=NEON_URL))
+        captured = {}
+
+        def _fake_engine(url, **kwargs):
+            captured["url"] = str(url)
+            captured["kwargs"] = kwargs
+            return _HangingBeginEngine(0)
+
+        monkeypatch.setattr(s, "create_async_engine", _fake_engine)
+        try:
+            s._init_engines()
+            assert captured["kwargs"]["connect_args"] == {
+                "timeout": s._POSTGRES_CONNECT_TIMEOUT_SECONDS
+            }
+        finally:
+            _restore_engine_globals(s)
+
+    def test_url_timeout_param_is_respected_over_default(self, monkeypatch):
+        s = _import_db_session()
+        url = NEON_URL + "&timeout=45"
+        _patch_settings(monkeypatch, _StubSettings(debug=False, db_url=url))
+        captured = {}
+
+        def _fake_engine(url, **kwargs):
+            captured["kwargs"] = kwargs
+            return _HangingBeginEngine(0)
+
+        monkeypatch.setattr(s, "create_async_engine", _fake_engine)
+        try:
+            s._init_engines()
+            # An explicit URL timeout must not be overridden by the default.
+            assert captured["kwargs"]["connect_args"] == {}
+        finally:
+            _restore_engine_globals(s)
+
+    def test_init_db_hang_fails_fast_with_clear_error(self, monkeypatch):
+        s = _import_db_session()
+        _patch_settings(monkeypatch, _StubSettings(debug=False, db_url=NEON_URL))
+        monkeypatch.setattr(s, "_DB_INIT_TIMEOUT_SECONDS", 0.4)
+        fake = _HangingBeginEngine(5)  # hangs far longer than the 0.4s guard
+        monkeypatch.setattr(s, "create_async_engine", lambda *a, **k: fake)
+
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError, match="init timeout 0.4s"):
+                asyncio.run(s.init_db())
+            assert time.monotonic() - started < 3, "init_db must fail fast, not hang"
+        finally:
+            _restore_engine_globals(s)
+
+    def test_debug_mode_timeout_still_falls_back_to_sqlite(self, monkeypatch):
+        """The local-development workflow is preserved: in DEBUG mode a hung
+        PostgreSQL still falls back to SQLite instead of failing."""
+        s = _import_db_session()
+        _patch_settings(monkeypatch, _StubSettings(debug=True, db_url=NEON_URL))
+        monkeypatch.setattr(s, "_DB_INIT_TIMEOUT_SECONDS", 0.4)
+        real_create_async_engine = s.create_async_engine
+        calls = {"n": 0}
+
+        def _engine(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _HangingBeginEngine(5)
+            return real_create_async_engine(*args, **kwargs)
+
+        monkeypatch.setattr(s, "create_async_engine", _engine)
+        try:
+            asyncio.run(s.init_db())  # must NOT raise in DEBUG mode
+            assert calls["n"] == 2
+            assert s._backend == "sqlite"
         finally:
             _restore_engine_globals(s)
 

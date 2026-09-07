@@ -200,6 +200,13 @@ A new user starts with a completely clean workspace.
 - **Production fails fast**: with `DEBUG=false`, a PostgreSQL configuration or
   connection failure aborts startup with a clear error instead of silently
   falling back to SQLite
+- **Startup never hangs on an unreachable database**: the asyncpg engine uses
+  a bounded connect timeout (10s unless the URL sets `timeout=`) and
+  `init_db` wraps its round-trip in a 30s guard. This matters because uvicorn
+  runs the app lifespan *before* it binds the listen port — an unbounded
+  connect to a suspended/blackholed database would keep the service in a
+  "no open ports" state until the platform's port scan times out, hiding the
+  real database error. With the guard, the actual failure surfaces in seconds
 
 ### Session Storage
 - Sessions are in-memory (fast, simple)

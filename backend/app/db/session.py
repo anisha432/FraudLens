@@ -14,6 +14,7 @@ Database selection
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import create_engine
@@ -37,6 +38,14 @@ _backend = None  # "sqlite" | "postgresql" | None — engine actually in use
 
 _DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///./fraud_detection.db"
 _DEFAULT_SQLITE_SYNC_URL = "sqlite:///./fraud_detection.db"
+
+# Startup must never hang on an unreachable PostgreSQL server (e.g. Neon on
+# Render): uvicorn runs the lifespan *before* it binds the listen port, so a
+# blocked connect keeps the service in "no open ports" state and the platform
+# reports a port-scan timeout instead of the real database error. Bound every
+# startup wait so the actual failure surfaces quickly and loudly.
+_POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
+_DB_INIT_TIMEOUT_SECONDS = 30
 
 # Query parameters that may safely remain on a PostgreSQL URL handed to
 # ``create_async_engine``. SQLAlchemy's asyncpg dialect forwards *every* URL
@@ -187,7 +196,19 @@ def _init_engines() -> None:
 
     try:
         async_url = normalize_async_database_url(db_url)
-        engine = create_async_engine(async_url, echo=settings.DEBUG, pool_pre_ping=True)
+        connect_args: dict[str, object] = {}
+        if "timeout" not in make_url(async_url).query:
+            # asyncpg's default connect timeout is 60s, and a SYN-blackholed
+            # host (suspended Neon compute, firewall drop, DNS hang) blocks even
+            # longer — long enough for the platform's port scan to time out
+            # first. Bound it unless the URL explicitly sets a timeout.
+            connect_args["timeout"] = _POSTGRES_CONNECT_TIMEOUT_SECONDS
+        engine = create_async_engine(
+            async_url,
+            echo=settings.DEBUG,
+            pool_pre_ping=True,
+            connect_args=connect_args,
+        )
         async_session_factory = async_sessionmaker(
             engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -271,8 +292,19 @@ async def init_db() -> None:
     from app.db.models import Base
 
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        try:
+            async with asyncio.timeout(_DB_INIT_TIMEOUT_SECONDS):
+                async with engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+        except TimeoutError:
+            raise RuntimeError(
+                f"Database initialization timed out: the configured database "
+                f"({_host_of(settings.DATABASE_URL or '')}) did not accept a "
+                f"connection in time "
+                f"(connect timeout {_POSTGRES_CONNECT_TIMEOUT_SECONDS}s, "
+                f"init timeout {_DB_INIT_TIMEOUT_SECONDS}s). Check that it is "
+                f"awake/reachable and DATABASE_URL is correct."
+            ) from None
     except Exception as e:
         if settings.DEBUG and _backend == "postgresql":
             logger.warning(
