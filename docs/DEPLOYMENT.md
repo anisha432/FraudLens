@@ -192,7 +192,11 @@ A new user starts with a completely clean workspace.
   DEBUG mode
 - **PostgreSQL** (asyncpg driver) is used in production — a plain
   `postgresql://` URL is normalized to `postgresql+asyncpg://`, and Neon's
-  `?sslmode=require` is translated to asyncpg's `ssl` parameter
+  `?sslmode=require` is translated to asyncpg's `ssl` parameter. Other
+  libpq-only query parameters such as `channel_binding` (asyncpg does not
+  implement SCRAM channel binding) are stripped during normalization, since
+  the asyncpg dialect would otherwise forward them to `asyncpg.connect()` and
+  crash startup with `TypeError: connect() got an unexpected keyword argument`
 - **Production fails fast**: with `DEBUG=false`, a PostgreSQL configuration or
   connection failure aborts startup with a clear error instead of silently
   falling back to SQLite

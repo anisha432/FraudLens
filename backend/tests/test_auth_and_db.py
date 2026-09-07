@@ -4,8 +4,10 @@ Covers the two production-critical fixes:
 
 1. PostgreSQL async driver handling — ``DATABASE_URL`` is normalized to the
    asyncpg driver before it ever reaches ``create_async_engine``, Neon's
-   ``sslmode`` parameter is translated to asyncpg's ``ssl`` parameter, and the
-   app refuses to silently fall back to SQLite when ``DEBUG=false``.
+   ``sslmode`` parameter is translated to asyncpg's ``ssl`` parameter,
+   libpq-only parameters such as ``channel_binding`` are stripped so they
+   never reach ``asyncpg.connect()``, and the app refuses to silently fall
+   back to SQLite when ``DEBUG=false``.
 2. passlib/bcrypt compatibility — bcrypt is pinned below 4.1 (see
    ``backend/requirements.txt``) and registration rejects passwords longer
    than the 72-byte bcrypt limit up front.
@@ -56,6 +58,40 @@ class TestAsyncUrlNormalization:
         # params to asyncpg.connect(), so sslmode must become ssl.
         assert "sslmode" not in parsed.query
         assert parsed.query.get("ssl") == "require"
+
+    def test_channel_binding_and_unknown_libpq_params_are_stripped(self):
+        # Neon-style pooled URL carrying libpq-only parameters. asyncpg does
+        # not implement channel binding (or accept libpq's other connection
+        # keywords), and the asyncpg dialect forwards every query param as an
+        # asyncpg.connect() kwarg — a leftover channel_binding previously
+        # crashed startup with "connect() got an unexpected keyword argument
+        # 'channel_binding'".
+        s = _import_db_session()
+        url = (
+            "postgresql://fraud_user:secret@ep-xyz-123-pooler.us-east-2.aws.neon.tech"
+            "/neondb?sslmode=require&channel_binding=require&application_name=fraudlens"
+        )
+        parsed = make_url(s.normalize_async_database_url(url))
+
+        assert parsed.drivername == "postgresql+asyncpg"
+        assert "channel_binding" not in parsed.query
+        assert "application_name" not in parsed.query
+        # sslmode is still translated to asyncpg's ssl parameter: TLS is kept.
+        assert parsed.query.get("ssl") == "require"
+
+    def test_supported_asyncpg_query_params_are_kept(self):
+        s = _import_db_session()
+        url = (
+            "postgresql+asyncpg://user:pass@db.example.com/db"
+            "?ssl=require&timeout=30&command_timeout=5&prepared_statement_cache_size=0"
+        )
+        query = dict(make_url(s.normalize_async_database_url(url)).query)
+        assert query == {
+            "ssl": "require",
+            "timeout": "30",
+            "command_timeout": "5",
+            "prepared_statement_cache_size": "0",
+        }
 
     def test_plain_postgres_url_gets_asyncpg_driver(self):
         s = _import_db_session()

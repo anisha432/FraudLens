@@ -38,6 +38,32 @@ _backend = None  # "sqlite" | "postgresql" | None — engine actually in use
 _DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///./fraud_detection.db"
 _DEFAULT_SQLITE_SYNC_URL = "sqlite:///./fraud_detection.db"
 
+# Query parameters that may safely remain on a PostgreSQL URL handed to
+# ``create_async_engine``. SQLAlchemy's asyncpg dialect forwards *every* URL
+# query parameter as a keyword argument to ``asyncpg.connect()``, and asyncpg
+# only accepts a fixed set of keywords. libpq-only parameters found on managed
+# PostgreSQL connection strings (e.g. Neon's ``channel_binding``) have no
+# asyncpg equivalent and would raise ``TypeError: connect() got an unexpected
+# keyword argument ...`` at connect time, so anything outside this set is
+# stripped during normalization.
+_ASYNCPG_URL_QUERY_PARAMS = frozenset({
+    # asyncpg.connect() keyword parameters.
+    "ssl",
+    "timeout",
+    "command_timeout",
+    "statement_cache_size",
+    "max_cached_statement_lifetime",
+    "max_cacheable_statement_size",
+    "min_ssl_protocol_version",
+    "max_ssl_protocol_version",
+    "target_session_attrs",
+    # SQLAlchemy asyncpg-dialect options (consumed by the dialect, not asyncpg).
+    "prepared_statement_cache_size",
+    "async_fallback",
+    # SQLAlchemy asyncpg multihost syntax (``?host=HostA:5432&host=HostB:5432``).
+    "host",
+})
+
 
 def _is_sqlite_url(url: str | None) -> bool:
     """Return True when a database URL points at SQLite."""
@@ -57,9 +83,12 @@ def normalize_async_database_url(url: str) -> str:
       raise "The asyncio extension requires an async driver".
     * The libpq ``sslmode`` query parameter found on Neon / managed PostgreSQL
       connection strings is translated to the ``ssl`` parameter that the
-      asyncpg dialect understands (asyncpg has no ``sslmode`` kwarg, and
-      unknown query parameters are forwarded to ``asyncpg.connect`` and would
-      raise ``TypeError``).
+      asyncpg dialect understands (asyncpg has no ``sslmode`` kwarg).
+    * Remaining query parameters are filtered to the set asyncpg / the asyncpg
+      dialect actually accepts. libpq-only parameters (e.g. ``channel_binding``,
+      which asyncpg does not implement) are otherwise forwarded verbatim to
+      ``asyncpg.connect`` by the dialect and raise ``TypeError`` at connect
+      time — exactly the production failure this filter prevents.
     """
     if _is_sqlite_url(url):
         return url
@@ -69,6 +98,11 @@ def normalize_async_database_url(url: str) -> str:
     sslmode = query.pop("sslmode", None)
     if sslmode is not None and "ssl" not in query:
         query["ssl"] = sslmode
+    query = {
+        key: value
+        for key, value in query.items()
+        if key in _ASYNCPG_URL_QUERY_PARAMS
+    }
     parsed = parsed.set(query=query)
     return parsed.render_as_string(hide_password=False)
 
