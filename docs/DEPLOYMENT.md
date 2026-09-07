@@ -208,7 +208,16 @@ A new user starts with a completely clean workspace.
 
 ### CORS
 - **DEBUG=true**: Allows all origins (development convenience)
-- **DEBUG=false**: Uses only configured `CORS_ORIGINS` list
+- **DEBUG=false**: The allowlist is the configured `CORS_ORIGINS` list **plus**
+  the FraudLens production frontend origin
+  (`https://fraudlens-frontend-1irz.onrender.com`), which is merged in code in
+  `backend/app/main.py` so it is always allowed even if `CORS_ORIGINS` is unset
+  or mistyped on the deployment. The env var can extend the list but never
+  remove the production frontend. `allow_origins` is never `["*"]` in
+  production because the app uses authentication.
+- The effective allowlist is logged at startup: `CORS allow_origins
+  (DEBUG=false): [...]` — check the Render logs to confirm the frontend origin
+  is present.
 
 ### WebSocket
 - Authentication via query parameter token

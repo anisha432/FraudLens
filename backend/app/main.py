@@ -57,23 +57,45 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — use configured origins in production, allow all in DEBUG
-if settings.DEBUG:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# CORS — allow all origins in DEBUG (local development only). In production
+# the allowlist is never "*" because the app uses authentication: it is the
+# configured CORS_ORIGINS (settings/env) PLUS the FraudLens production frontend
+# origin below, which is always allowed so a missing or mistyped CORS_ORIGINS
+# on the deployment can never break browser requests — e.g. the
+# POST /api/v1/auth/register preflight (OPTIONS) must return
+# Access-Control-Allow-Origin for the deployed frontend.
+PROD_FRONTEND_ORIGINS: tuple[str, ...] = ("https://fraudlens-frontend-1irz.onrender.com",)
+
+
+def resolve_cors_origins(*, debug: bool, configured_origins: list[str]) -> list[str]:
+    """Return the CORSMiddleware ``allow_origins`` list for the current mode.
+
+    DEBUG:       ["*"] (development convenience; behavior unchanged).
+    Production:  the configured origins plus the FraudLens production frontend,
+                 de-duplicated and order-preserving. The frontend origin is
+                 merged here rather than taken from settings alone so that the
+                 CORS_ORIGINS env var can extend — but never remove — it.
+    """
+    if debug:
+        return ["*"]
+    merged: list[str] = []
+    for origin in [*configured_origins, *PROD_FRONTEND_ORIGINS]:
+        if origin not in merged:
+            merged.append(origin)
+    return merged
+
+
+_cors_origins = resolve_cors_origins(
+    debug=settings.DEBUG, configured_origins=settings.CORS_ORIGINS
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+logger.info("CORS allow_origins (DEBUG=%s): %s", settings.DEBUG, _cors_origins)
 
 # Include routers
 app.include_router(health.router, tags=["Health"])
