@@ -25,15 +25,23 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Fraud Detection Platform...")
     try:
         await init_db()
-        logger.info("Database initialized")
         # Seed the demo user
         from app.db.session import async_session_factory
         if async_session_factory:
             async with async_session_factory() as db:
                 from app.api.v1.auth import seed_demo_user
                 await seed_demo_user(db)
+        logger.info("Database initialized")
     except Exception as e:
-        logger.warning(f"Database init failed (will use in-memory): {e}")
+        if settings.DEBUG:
+            logger.warning(f"Database startup incomplete in DEBUG mode ({e}); continuing")
+        else:
+            logger.error(
+                "Database initialization FAILED (DEBUG=false). "
+                "Refusing to start without a working production database. "
+                "Check DATABASE_URL / DATABASE_URL_SYNC and retry."
+            )
+            raise
     yield
     logger.info("Shutting down...")
     try:

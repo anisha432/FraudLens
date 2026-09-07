@@ -55,6 +55,11 @@ class RegisterRequest(BaseModel):
     def validate_password(cls, v: str) -> str:
         if len(v) < 6:
             raise ValueError("Password must be at least 6 characters")
+        # bcrypt only uses the first 72 bytes of a password. Reject longer
+        # passwords up front instead of silently truncating or failing inside
+        # the hashing backend at startup/registration time.
+        if len(v.encode("utf-8")) > 72:
+            raise ValueError("Password must be at most 72 bytes (bcrypt limit)")
         return v
 
     @field_validator("confirm_password")

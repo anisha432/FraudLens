@@ -10,7 +10,16 @@ from passlib.context import CryptContext
 
 logger = logging.getLogger(__name__)
 
-# Password hashing context using bcrypt
+# Password hashing context using bcrypt.
+#
+# NOTE: keep bcrypt pinned to 4.0.x in backend/requirements.txt. passlib 1.7.4
+# (last release) is incompatible with bcrypt >= 4.1: passlib cannot read the
+# bcrypt version ("(trapped) error reading bcrypt version") and bcrypt >= 4.1
+# raises "password cannot be longer than 72 bytes" instead of truncating the
+# way passlib expects. See backend/requirements.txt.
+#
+# Registration validates the 72-byte bcrypt limit up front (app/api/v1/auth.py)
+# so long passwords are rejected rather than silently truncated.
 pwd_context = CryptContext(
     schemes=["bcrypt"],
     deprecated="auto",

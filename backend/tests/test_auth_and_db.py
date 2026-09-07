@@ -1,0 +1,319 @@
+"""Authentication and database configuration tests.
+
+Covers the two production-critical fixes:
+
+1. PostgreSQL async driver handling — ``DATABASE_URL`` is normalized to the
+   asyncpg driver before it ever reaches ``create_async_engine``, Neon's
+   ``sslmode`` parameter is translated to asyncpg's ``ssl`` parameter, and the
+   app refuses to silently fall back to SQLite when ``DEBUG=false``.
+2. passlib/bcrypt compatibility — bcrypt is pinned below 4.1 (see
+   ``backend/requirements.txt``) and registration rejects passwords longer
+   than the 72-byte bcrypt limit up front.
+
+Also exercises the login / register / logout flow, demo credentials and user
+isolation against a throwaway SQLite database (see ``conftest.py``).
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
+
+from app.main import app
+
+
+# --------------------------------------------------------------------------
+# PostgreSQL URL normalization (asyncpg / psycopg2)
+# --------------------------------------------------------------------------
+
+NEON_URL = "postgresql://fraud_user:secret@ep-xyz-123.us-east-2.aws.neon.tech/neondb?sslmode=require"
+
+
+def _import_db_session():
+    # Imported lazily so engine globals are only touched by the tests that
+    # need them; the FastAPI lifespan tests initialize the real (SQLite)
+    # engine independently.
+    import app.db.session as s
+    return s
+
+
+class TestAsyncUrlNormalization:
+    def test_neon_url_uses_asyncpg_and_translates_sslmode(self):
+        s = _import_db_session()
+        result = s.normalize_async_database_url(NEON_URL)
+        parsed = make_url(result)
+
+        assert parsed.drivername == "postgresql+asyncpg"
+        # The async engine must never be handed a psycopg2/plain-postgres URL.
+        assert "psycopg2" not in parsed.drivername
+        assert parsed.host == "ep-xyz-123.us-east-2.aws.neon.tech"
+        assert parsed.database == "neondb"
+        assert parsed.password == "secret"
+        # asyncpg has no sslmode kwarg; the asyncpg dialect forwards query
+        # params to asyncpg.connect(), so sslmode must become ssl.
+        assert "sslmode" not in parsed.query
+        assert parsed.query.get("ssl") == "require"
+
+    def test_plain_postgres_url_gets_asyncpg_driver(self):
+        s = _import_db_session()
+        result = s.normalize_async_database_url(
+            "postgresql://user:pass@db.example.com:5432/fraud_detection"
+        )
+        parsed = make_url(result)
+        assert parsed.drivername == "postgresql+asyncpg"
+        assert parsed.host == "db.example.com"
+        assert parsed.port == 5432
+        assert parsed.query == {}
+
+    def test_short_postgres_scheme_is_normalized(self):
+        s = _import_db_session()
+        result = s.normalize_async_database_url(
+            "postgres://user:pass@db.example.com:5432/db"
+        )
+        assert make_url(result).drivername == "postgresql+asyncpg"
+
+    def test_already_asyncpg_url_is_idempotent(self):
+        s = _import_db_session()
+        result = s.normalize_async_database_url(
+            "postgresql+asyncpg://user:pass@db.example.com/db?ssl=require"
+        )
+        parsed = make_url(result)
+        assert parsed.drivername == "postgresql+asyncpg"
+        assert parsed.query.get("ssl") == "require"
+
+    def test_sqlite_url_passes_through_unchanged(self):
+        s = _import_db_session()
+        url = "sqlite+aiosqlite:///./fraud_detection.db"
+        assert s.normalize_async_database_url(url) == url
+
+
+class TestSyncUrlNormalization:
+    def test_neon_url_uses_psycopg2_and_keeps_sslmode(self):
+        s = _import_db_session()
+        result = s.normalize_sync_database_url(NEON_URL)
+        parsed = make_url(result)
+        assert parsed.drivername == "postgresql+psycopg2"
+        # psycopg2 (libpq) understands sslmode natively.
+        assert parsed.query.get("sslmode") == "require"
+
+    def test_sqlite_url_passes_through_unchanged(self):
+        s = _import_db_session()
+        url = "sqlite:///./fraud_detection.db"
+        assert s.normalize_sync_database_url(url) == url
+
+
+# --------------------------------------------------------------------------
+# No silent SQLite fallback in production
+# --------------------------------------------------------------------------
+
+class _StubSettings:
+    def __init__(self, debug: bool, db_url: str, db_url_sync: str = ""):
+        self.DEBUG = debug
+        self.DATABASE_URL = db_url
+        self.DATABASE_URL_SYNC = db_url_sync
+
+
+def _patch_settings(monkeypatch, settings):
+    import app.core.config as config
+    # session.py resolves get_settings via ``from app.core.config import ...``
+    # inside its functions, so patching the config module is sufficient.
+    monkeypatch.setattr(config, "get_settings", lambda: settings)
+
+
+def _restore_engine_globals(s):
+    for name in ("engine", "async_session_factory", "sync_engine", "SyncSessionLocal", "_backend"):
+        setattr(s, name, None)
+
+
+class TestProductionFailFast:
+    def test_production_engine_failure_raises_no_sqlite_fallback(self, monkeypatch):
+        s = _import_db_session()
+        _patch_settings(monkeypatch, _StubSettings(debug=False, db_url=NEON_URL))
+        monkeypatch.setattr(s, "create_async_engine", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        def _forbid_sqlite_fallback(*a, **k):
+            raise AssertionError("SQLite fallback must NOT happen in production (DEBUG=false)")
+
+        monkeypatch.setattr(s, "_configure_sqlite", _forbid_sqlite_fallback)
+        try:
+            with pytest.raises(RuntimeError, match="PostgreSQL"):
+                s._init_engines()
+        finally:
+            _restore_engine_globals(s)
+        assert s.engine is None
+
+    def test_debug_mode_falls_back_to_sqlite(self, monkeypatch):
+        s = _import_db_session()
+        _patch_settings(monkeypatch, _StubSettings(debug=True, db_url=NEON_URL))
+        real_create_async_engine = s.create_async_engine
+        calls = {"n": 0}
+
+        def _flaky_async_engine(*args, **kwargs):
+            # First attempt (PostgreSQL engine) fails; the DEBUG-mode fallback
+            # to SQLite must still be able to create its own engine.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("driver unavailable")
+            return real_create_async_engine(*args, **kwargs)
+
+        monkeypatch.setattr(s, "create_async_engine", _flaky_async_engine)
+        try:
+            # Must NOT raise in DEBUG mode.
+            s._init_engines()
+            assert calls["n"] == 2
+            assert s._backend == "sqlite"
+            assert s.async_session_factory is not None
+            assert s.engine is not None
+            assert "sqlite" in s.engine.url.drivername
+        finally:
+            _restore_engine_globals(s)
+
+    def test_configured_sqlite_is_used_for_local_development(self, monkeypatch):
+        s = _import_db_session()
+        url = "sqlite+aiosqlite:///./local_dev_only.db"
+        _patch_settings(monkeypatch, _StubSettings(debug=True, db_url=url, db_url_sync="sqlite:///./local_dev_only.db"))
+        try:
+            s._init_engines()
+            assert s._backend == "sqlite"
+            assert s.engine.url.drivername == "sqlite+aiosqlite"
+        finally:
+            _restore_engine_globals(s)
+
+
+# --------------------------------------------------------------------------
+# passlib / bcrypt compatibility
+# --------------------------------------------------------------------------
+
+class TestBcryptCompat:
+    def test_hash_and_verify_roundtrip(self):
+        from app.core.auth import hash_password, verify_password
+        password = f"str0ng-pass-{uuid.uuid4().hex}"
+        hashed = hash_password(password)
+        assert hashed.startswith("$2b$")
+        assert hashed != password  # never stored in plaintext
+        assert verify_password(password, hashed) is True
+        assert verify_password("wrong-password", hashed) is False
+
+    def test_no_bcrypt_version_trapped_error(self, caplog):
+        """passlib 1.7.4 + bcrypt 4.0.x must not log
+        '(trapped) error reading bcrypt version'."""
+        from app.core.auth import hash_password
+        with caplog.at_level(logging.WARNING, logger="passlib.handlers.bcrypt"):
+            hash_password("another-demo-pass")
+        assert "error reading bcrypt version" not in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Auth flow: demo credentials, register/login/logout, isolation
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def client():
+    with TestClient(app) as c:
+        yield c
+
+
+def _register(client, name: str, email: str, password: str):
+    return client.post(
+        "/api/v1/auth/register",
+        json={"name": name, "email": email, "password": password, "confirm_password": password},
+    )
+
+
+class TestAuthFlow:
+    def test_demo_credentials_login(self, client):
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@fraudlens.io", "password": "fraudlens"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["token"]
+        assert body["user"]["email"] == "admin@fraudlens.io"
+        assert body["user"]["role"] == "admin"
+
+    def test_demo_credentials_wrong_password_rejected(self, client):
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@fraudlens.io", "password": "not-the-password"},
+        )
+        assert resp.status_code == 401
+
+    def test_register_rejects_password_over_72_bytes(self, client):
+        email = f"longpass-{uuid.uuid4().hex[:8]}@example.com"
+        resp = _register(client, "Long Password", email, "a" * 73)
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert any("72 bytes" in str(d) for d in detail)
+
+    def test_register_accepts_exactly_72_bytes(self, client):
+        email = f"max72-{uuid.uuid4().hex[:8]}@example.com"
+        password = "a" * 72
+        resp = _register(client, "Max 72", email, password)
+        assert resp.status_code == 200, resp.text
+        # And the user can log in with it.
+        login = client.post("/api/v1/auth/login", json={"email": email, "password": password})
+        assert login.status_code == 200
+
+    def test_register_duplicate_email_rejected(self, client):
+        email = f"dup-{uuid.uuid4().hex[:8]}@example.com"
+        assert _register(client, "First", email, "password123").status_code == 200
+        resp = _register(client, "Second", email, "password123")
+        assert resp.status_code == 409
+
+    def test_register_login_logout_flow(self, client):
+        email = f"flow-{uuid.uuid4().hex[:8]}@example.com"
+        register = _register(client, "Flow User", email, "password123")
+        assert register.status_code == 200
+        token = register.json()["token"]
+
+        me = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert me.status_code == 200
+        assert me.json()["user"]["email"] == email
+
+        logout = client.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {token}"})
+        assert logout.status_code == 200
+
+        # Token must be invalidated after logout.
+        me_after = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert me_after.status_code == 401
+
+    def test_user_isolation(self, client):
+        email_a = f"iso-a-{uuid.uuid4().hex[:8]}@example.com"
+        email_b = f"iso-b-{uuid.uuid4().hex[:8]}@example.com"
+
+        register_a = _register(client, "User A", email_a, "passwordA1")
+        assert register_a.status_code == 200
+        login_a = client.post("/api/v1/auth/login", json={"email": email_a, "password": "passwordA1"})
+        assert login_a.status_code == 200
+        token_a = login_a.json()["token"]
+
+        register_b = _register(client, "User B", email_b, "passwordB1")
+        assert register_b.status_code == 200
+        login_b = client.post("/api/v1/auth/login", json={"email": email_b, "password": "passwordB1"})
+        assert login_b.status_code == 200
+        token_b = login_b.json()["token"]
+
+        me_a = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token_a}"})
+        me_b = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {token_b}"})
+        assert me_a.json()["user"]["email"] == email_a
+        assert me_b.json()["user"]["email"] == email_b
+
+        # Activity log is owner-scoped: B must only ever see B's own events
+        # (a REGISTER and a LOGIN), never A's.
+        activity_b = client.get(
+            "/api/v1/auth/activity", headers={"Authorization": f"Bearer {token_b}"}
+        )
+        assert activity_b.status_code == 200
+        body = activity_b.json()
+        assert body["total"] == 2
+        assert all(email_a not in str(a.get("description", "")) for a in body["activities"])
+
+        # A sees only A's events too.
+        activity_a = client.get(
+            "/api/v1/auth/activity", headers={"Authorization": f"Bearer {token_a}"}
+        )
+        assert activity_a.json()["total"] == 2

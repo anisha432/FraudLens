@@ -187,9 +187,15 @@ A new user starts with a completely clean workspace.
 - Global model fallback loads from disk if available
 
 ### SQLite vs PostgreSQL
-- **SQLite** is the local development fallback (no setup required)
-- **PostgreSQL** is recommended for production
-- The app auto-detects and falls back gracefully
+- **SQLite** is the local development default (no setup required) — used when
+  `DATABASE_URL` is unset/SQLite or when a PostgreSQL configuration fails in
+  DEBUG mode
+- **PostgreSQL** (asyncpg driver) is used in production — a plain
+  `postgresql://` URL is normalized to `postgresql+asyncpg://`, and Neon's
+  `?sslmode=require` is translated to asyncpg's `ssl` parameter
+- **Production fails fast**: with `DEBUG=false`, a PostgreSQL configuration or
+  connection failure aborts startup with a clear error instead of silently
+  falling back to SQLite
 
 ### Session Storage
 - Sessions are in-memory (fast, simple)

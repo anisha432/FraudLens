@@ -1,7 +1,29 @@
-"""Database session management with fallback to SQLite."""
+"""Database session management.
+
+Database selection
+------------------
+* PostgreSQL is used whenever ``DATABASE_URL`` points to PostgreSQL (e.g. Neon
+  on Render). The async engine always uses **asyncpg** — a plain
+  ``postgresql://`` (psycopg2) URL is never passed to ``create_async_engine``.
+* SQLite is used for local development only: either because it is the default
+  (no ``DATABASE_URL`` configured) or because a PostgreSQL configuration
+  failed while ``DEBUG=true``.
+* When ``DEBUG=false`` (production), a PostgreSQL configuration or connection
+  failure is a hard startup error. The app must not silently fall back to
+  SQLite in production.
+"""
 from __future__ import annotations
 
 import logging
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -10,57 +32,179 @@ engine = None
 async_session_factory = None
 sync_engine = None
 SyncSessionLocal = None
-_db_available = False
+
+_backend = None  # "sqlite" | "postgresql" | None — engine actually in use
+
+_DEFAULT_SQLITE_URL = "sqlite+aiosqlite:///./fraud_detection.db"
+_DEFAULT_SQLITE_SYNC_URL = "sqlite:///./fraud_detection.db"
 
 
-def _init_engines():
-    """Initialize database engines. Falls back to SQLite if PostgreSQL unavailable."""
-    global engine, async_session_factory, sync_engine, SyncSessionLocal, _db_available
+def _is_sqlite_url(url: str | None) -> bool:
+    """Return True when a database URL points at SQLite."""
+    if not url:
+        return False
+    drivername = url.split("://", 1)[0].strip().lower()
+    return drivername == "sqlite" or drivername.startswith("sqlite+")
+
+
+def normalize_async_database_url(url: str) -> str:
+    """Return a URL that is safe to pass to ``create_async_engine``.
+
+    * SQLite URLs pass through unchanged.
+    * Any PostgreSQL URL is forced onto the **asyncpg** driver — a plain
+      ``postgresql://`` (or ``postgres://``) URL must never reach the async
+      engine, since SQLAlchemy would load the synchronous psycopg2 driver and
+      raise "The asyncio extension requires an async driver".
+    * The libpq ``sslmode`` query parameter found on Neon / managed PostgreSQL
+      connection strings is translated to the ``ssl`` parameter that the
+      asyncpg dialect understands (asyncpg has no ``sslmode`` kwarg, and
+      unknown query parameters are forwarded to ``asyncpg.connect`` and would
+      raise ``TypeError``).
+    """
+    if _is_sqlite_url(url):
+        return url
+
+    parsed = make_url(url).set(drivername="postgresql+asyncpg")
+    query = dict(parsed.query)
+    sslmode = query.pop("sslmode", None)
+    if sslmode is not None and "ssl" not in query:
+        query["ssl"] = sslmode
+    parsed = parsed.set(query=query)
+    return parsed.render_as_string(hide_password=False)
+
+
+def normalize_sync_database_url(url: str) -> str:
+    """Return a URL safe for a synchronous ``create_engine`` call.
+
+    * SQLite URLs pass through unchanged.
+    * PostgreSQL URLs are forced onto the psycopg2 driver (the default
+      PostgreSQL driver), which natively understands ``sslmode``.
+    """
+    if _is_sqlite_url(url):
+        return url
+
+    parsed = make_url(url).set(drivername="postgresql+psycopg2")
+    return parsed.render_as_string(hide_password=False)
+
+
+def _host_of(url: str) -> str:
+    """Best-effort host:port description — never includes credentials."""
+    try:
+        parsed = make_url(url)
+        return f"{parsed.host or '?'}:{parsed.port or 5432}"
+    except Exception:
+        return (url.split("@")[-1].split("/")[0] or url) if "@" in url else url
+
+
+def _configure_sqlite(settings, *, fallback: bool) -> None:
+    """Configure the engines to use SQLite (local development only)."""
+    global engine, async_session_factory, sync_engine, SyncSessionLocal, _backend
+
+    # Release any previously created engine (e.g. a failed PostgreSQL engine).
+    # Note: AsyncEngine.dispose() is a coroutine, so dispose the underlying
+    # sync engine here; async callers dispose properly before reconfiguring.
+    if engine is not None:
+        try:
+            engine.sync_engine.dispose()
+        except Exception:
+            pass
+        engine = None
+    if sync_engine is not None:
+        try:
+            sync_engine.dispose()
+        except Exception:
+            pass
+        sync_engine = None
+        SyncSessionLocal = None
+
+    sqlite_url = _DEFAULT_SQLITE_URL
+    sqlite_sync_url = _DEFAULT_SQLITE_SYNC_URL
+    if not fallback:
+        # Honor an explicitly configured SQLite URL (custom local DB path).
+        if _is_sqlite_url(settings.DATABASE_URL):
+            sqlite_url = settings.DATABASE_URL
+        if _is_sqlite_url(settings.DATABASE_URL_SYNC):
+            sqlite_sync_url = settings.DATABASE_URL_SYNC
+
+    engine = create_async_engine(sqlite_url, echo=settings.DEBUG)
+    async_session_factory = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    _backend = "sqlite"
+    if fallback:
+        logger.warning(
+            "Falling back to SQLite (%s) — local development only.", sqlite_url
+        )
+    else:
+        logger.info("Using SQLite database for local development: %s", sqlite_url)
+
+
+def _init_engines() -> None:
+    """Initialize the async engine based on the configured ``DATABASE_URL``."""
+    global engine, async_session_factory, _backend
 
     from app.core.config import get_settings
     settings = get_settings()
 
-    # Try PostgreSQL first, fall back to SQLite
-    db_url = settings.DATABASE_URL
-    db_url_sync = settings.DATABASE_URL_SYNC
+    db_url = (settings.DATABASE_URL or "").strip()
+    if _is_sqlite_url(db_url):
+        _configure_sqlite(settings, fallback=False)
+        return
 
     try:
-        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-        from sqlalchemy.orm import sessionmaker
-        from sqlalchemy import create_engine
-
-        # Try asyncpg first
-        try:
-            engine = create_async_engine(db_url, echo=settings.DEBUG, pool_pre_ping=True)
-            async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-            sync_engine = create_engine(db_url_sync, echo=False, pool_pre_ping=True)
-            SyncSessionLocal = sessionmaker(bind=sync_engine)
-            _db_available = True
-            logger.info(f"Connected to PostgreSQL: {db_url.split('@')[-1] if '@' in db_url else db_url}")
-            return
-        except Exception as e:
-            logger.warning(f"PostgreSQL unavailable ({e}), falling back to SQLite")
-            engine = None
-
-        # Fallback to SQLite
-        sqlite_url = "sqlite+aiosqlite:///./fraud_detection.db"
-        sqlite_sync_url = "sqlite:///./fraud_detection.db"
-        engine = create_async_engine(sqlite_url, echo=settings.DEBUG)
-        async_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-        sync_engine = create_engine(sqlite_sync_url, echo=False)
-        SyncSessionLocal = sessionmaker(bind=sync_engine)
-        _db_available = True
-        logger.info("Using SQLite fallback database")
-
+        async_url = normalize_async_database_url(db_url)
+        engine = create_async_engine(async_url, echo=settings.DEBUG, pool_pre_ping=True)
+        async_session_factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
+        _backend = "postgresql"
+        logger.info("Configured PostgreSQL engine (asyncpg) at %s", _host_of(async_url))
     except Exception as e:
-        logger.error(f"Failed to initialize any database: {e}")
-        _db_available = False
+        if settings.DEBUG:
+            logger.warning(
+                "PostgreSQL unavailable in DEBUG mode (%s); falling back to SQLite", e
+            )
+            _configure_sqlite(settings, fallback=True)
+            return
+        logger.error(
+            "PostgreSQL engine configuration FAILED (DEBUG=false). "
+            "Refusing to start with a SQLite fallback in production."
+        )
+        raise RuntimeError(
+            f"PostgreSQL engine could not be initialized: {e}. "
+            f"Check DATABASE_URL ({_host_of(db_url)})."
+        ) from e
 
 
-def _ensure_engines():
+def _ensure_engines() -> None:
     """Lazily initialize engines on first use."""
     if engine is None:
         _init_engines()
+
+
+def _ensure_sync_engine() -> None:
+    """Lazily create the synchronous engine — only used where sync DB access
+    is explicitly required (e.g. ``init_db_sync``). psycopg2 is therefore
+    never loaded during normal async operation."""
+    global sync_engine, SyncSessionLocal
+
+    if sync_engine is not None:
+        return
+
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    db_url_sync = (settings.DATABASE_URL_SYNC or "").strip()
+    if not db_url_sync:
+        db_url_sync = settings.DATABASE_URL
+
+    if _backend == "sqlite" or _is_sqlite_url(db_url_sync):
+        url = db_url_sync if _is_sqlite_url(db_url_sync) else _DEFAULT_SQLITE_SYNC_URL
+        sync_engine = create_engine(url, echo=False)
+    else:
+        url = normalize_sync_database_url(db_url_sync)
+        sync_engine = create_engine(url, echo=False, pool_pre_ping=True)
+    SyncSessionLocal = sessionmaker(bind=sync_engine, expire_on_commit=False)
 
 
 async def get_db():
@@ -75,31 +219,61 @@ async def get_db():
             await session.close()
 
 
-async def init_db():
-    """Initialize database tables."""
+async def init_db() -> None:
+    """Initialize database tables.
+
+    Performs a real connection round-trip (``create_all``). In production
+    (``DEBUG=false``) any failure is re-raised so startup stops loudly; in
+    DEBUG mode a PostgreSQL that cannot be reached falls back to SQLite to
+    preserve the local development workflow.
+    """
     _ensure_engines()
     if engine is None:
-        return
+        raise RuntimeError("Database not available: no engine could be initialized")
+
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    from app.db.models import Base
+
     try:
-        from app.db.models import Base
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except Exception as e:
-        logger.warning(f"DB table creation failed: {e}")
+        if settings.DEBUG and _backend == "postgresql":
+            logger.warning(
+                "PostgreSQL unreachable in DEBUG mode (%s); falling back to SQLite", e
+            )
+            await engine.dispose()
+            _configure_sqlite(settings, fallback=True)
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        else:
+            raise RuntimeError(
+                f"Database initialization failed: {e}. "
+                f"Check that the configured database is reachable "
+                f"({_host_of(settings.DATABASE_URL or '')})."
+            ) from e
 
 
-async def close_db():
+async def close_db() -> None:
     """Close database connections."""
     if engine is not None:
         try:
             await engine.dispose()
         except Exception:
             pass
-
-
-def init_db_sync():
-    """Initialize database tables synchronously."""
-    _ensure_engines()
     if sync_engine is not None:
-        from app.db.models import Base
-        Base.metadata.create_all(bind=sync_engine)
+        try:
+            sync_engine.dispose()
+        except Exception:
+            pass
+
+
+def init_db_sync() -> None:
+    """Initialize database tables synchronously (sync engine only)."""
+    _ensure_sync_engine()
+    if sync_engine is None:
+        raise RuntimeError("Synchronous database engine not available")
+    from app.db.models import Base
+    Base.metadata.create_all(bind=sync_engine)
