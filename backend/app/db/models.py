@@ -9,7 +9,7 @@ from sqlalchemy import (
     Index, Boolean, ForeignKey, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
@@ -79,8 +79,6 @@ class Transaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    alerts = relationship("Alert", back_populates="transaction", lazy="selectin")
-
     __table_args__ = (
         Index("idx_txn_owner", "owner_id"),
         Index("idx_txn_owner_id", "owner_id", "transaction_id"),
@@ -94,10 +92,18 @@ class Alert(Base):
     """Fraud alert — scoped to owner via transaction."""
     __tablename__ = "alerts"
 
+    # Note: ``transaction_id`` deliberately has NO foreign key to
+    # ``transactions.transaction_id``. PostgreSQL (unlike SQLite) requires a
+    # foreign-key target to be a primary key or carry a UNIQUE constraint, and
+    # ``transaction_id`` is a non-unique business key (user-supplied via
+    # /transactions/predict and generated per simulation). Alerts are always
+    # inserted in the same commit as their parent transaction (see
+    # app/api/v1/ws.py) and all lookups are owner-scoped, so referential
+    # integrity is guaranteed by the application flow.
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id = Column(String(255), ForeignKey("users.id"), nullable=False, index=True)
     alert_id = Column(String(255), nullable=False, index=True)
-    transaction_id = Column(String(255), ForeignKey("transactions.transaction_id"), nullable=False)
+    transaction_id = Column(String(255), nullable=False, index=True)
     severity = Column(String(50), nullable=False)
     risk_score = Column(Float, nullable=True)
     reasons = Column(JSON, nullable=True)
@@ -106,8 +112,6 @@ class Alert(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     resolved_at = Column(DateTime, nullable=True)
-
-    transaction = relationship("Transaction", back_populates="alerts", lazy="selectin")
 
     __table_args__ = (
         Index("idx_alert_owner", "owner_id"),

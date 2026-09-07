@@ -142,6 +142,53 @@ class TestSyncUrlNormalization:
 
 
 # --------------------------------------------------------------------------
+# PostgreSQL schema compatibility (foreign keys must target unique columns)
+# --------------------------------------------------------------------------
+
+class TestPostgresSchemaCompat:
+    def test_all_foreign_keys_reference_unique_columns(self):
+        """PostgreSQL rejects a FK whose target is not a primary key or a
+        unique column (SQLSTATE 42830: "there is no unique constraint matching
+        given keys for referenced table"), whereas SQLite silently allows it.
+        Every FK in the metadata must therefore target a unique column so the
+        schema created by ``create_all`` is valid on both backends."""
+        from sqlalchemy import UniqueConstraint
+
+        from app.db.models import Base
+
+        problems = []
+        for table in Base.metadata.sorted_tables:
+            for fk in table.foreign_key_constraints:
+                for element in fk.elements:
+                    target = element.column
+                    is_pk = target.primary_key
+                    covered = target.unique or any(
+                        target.name in {c.name for c in uc.columns}
+                        for uc in target.table.constraints
+                        if isinstance(uc, UniqueConstraint)
+                    )
+                    if not (is_pk or covered):
+                        problems.append(
+                            f"{table.name}.{element.parent.name} -> "
+                            f"{target.table.name}.{target.name}"
+                        )
+        assert problems == [], (
+            "Foreign keys must reference PK/unique columns for PostgreSQL: "
+            + ", ".join(problems)
+        )
+
+    def test_alerts_transaction_id_is_not_a_foreign_key(self):
+        """alerts.transaction_id references the non-unique business key
+        transactions.transaction_id, which PostgreSQL will not accept as an FK
+        target. The column is kept (indexed) but the FK constraint is dropped;
+        only the users.id FK remains."""
+        from app.db.models import Alert
+
+        fk_targets = sorted(fk.target_fullname for fk in Alert.__table__.foreign_keys)
+        assert fk_targets == ["users.id"]
+
+
+# --------------------------------------------------------------------------
 # No silent SQLite fallback in production
 # --------------------------------------------------------------------------
 
