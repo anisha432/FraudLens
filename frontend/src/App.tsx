@@ -96,10 +96,6 @@ export default function App() {
   // /command when systemStatus has loaded. The route /onboarding is where the
   // full onboarding flow (upload + training) lives; the global nav "New Analysis"
   // button also points there.
-  //
-  // hasDataset is still derived from systemStatus purely for optional UI hints
-  // (e.g. the nav badge). It is NOT used to hide routes.
-  const hasDataset = systemStatus?.hasDataset && systemStatus?.modelsLoaded > 0;
 
   return (
     <div className="app-layout">
