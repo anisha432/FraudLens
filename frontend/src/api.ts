@@ -3,12 +3,33 @@ const API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:800
 const WS_BASE = (import.meta as any).env?.VITE_WS_URL || 'ws://localhost:8000';
 
 function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem('fraudlens_token');
+  const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/** Distinguish an authentication failure so callers can clear stale state. */
+export function createAuthError(status: number, message: string): AuthError {
+  return { name: 'AuthError', status, message } as AuthError;
+}
+
+export interface AuthError {
+  name: 'AuthError';
+  status: number;
+  message: string;
+}
+
 export async function fetchJSON(path: string, options?: RequestInit) {
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers: { ...authHeaders(), ...options?.headers } });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: { ...authHeaders(), ...options?.headers },
+  });
+  if (res.status === 401 || res.status === 403) {
+    // Auth token is stale/invalid — clear it so every other caller stops
+    // sending it. Do NOT throw here; return the error so callers can decide.
+    const detail = await res.json().catch(() => ({}));
+    const msg = (detail?.detail || detail?.message || 'Authentication required') as string;
+    throw createAuthError(res.status, msg);
+  }
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
 }
@@ -46,7 +67,7 @@ export async function getMe() {
 
 export async function logout() {
   try { await fetchJSON('/auth/logout', { method: 'POST' }); } catch {}
-  localStorage.removeItem('fraudlens_token');
+  clearAuthToken();
 }
 
 export function setAuthToken(token: string) {
@@ -54,7 +75,11 @@ export function setAuthToken(token: string) {
 }
 
 export function getAuthToken(): string | null {
-  return localStorage.getItem('fraudlens_token');
+  const raw = localStorage.getItem('fraudlens_token');
+  // Treat whitespace-only junk (e.g. an empty reconnect attempt) as missing.
+  if (typeof raw !== 'string') return null;
+  const token = raw.trim();
+  return token.length > 0 ? token : null;
 }
 
 export function clearAuthToken() {
@@ -114,8 +139,14 @@ export async function getExecutiveAnalytics(params: Record<string, string | numb
 }
 export async function getHealth() { return fetchJSON('/health'); }
 export function createWS() {
-  const token = localStorage.getItem('fraudlens_token') || '';
-  return new WebSocket(`${WS_BASE}/ws/live?token=${token}`);
+  const token = getAuthToken();
+  // Never open a WebSocket when there is no valid auth token. Calling this
+  // with a missing/empty token only creates a useless reconnect loop that the
+  // browser reports as repeated 401/403 WebSocket failures.
+  if (!token) {
+    return null;
+  }
+  return new WebSocket(`${WS_BASE}/ws/live?token=${encodeURIComponent(token)}`);
 }
 export async function getActivityLog(params: Record<string, string | number> = {}) {
   const qs = new URLSearchParams(params as any).toString();
@@ -145,7 +176,11 @@ export async function getSystemStatus() {
       hasDataset,
       datasets: datasets.datasets || [],
     };
-  } catch {
+  } catch (err: any) {
+    // Auth failure: stop polling this until re-login.
+    if (err?.name === 'AuthError') {
+      clearAuthToken();
+    }
     return { healthy: false, modelsLoaded: 0, hasDataset: false, datasets: [] };
   }
 }

@@ -22,9 +22,70 @@ import logging
 import time
 import uuid
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
+
+
+# --------------------------------------------------------------------------
+# WebSocket auth: valid/missing/invalid/expired token
+# --------------------------------------------------------------------------
+
+
+class TestWebSocketAuth:
+    def test_websocket_accepts_valid_token(self, client):
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@fraudlens.io", "password": "fraudlens"},
+        )
+        assert resp.status_code == 200, resp.text
+        token = resp.json()["token"]
+
+        with client.websocket_connect(f"/ws/live?token={token}") as ws:
+            assert ws.receive_text()  # may be the initial heartbeat once the app enables it
+            # A valid token is accepted: the connection was upgraded.
+
+    def test_websocket_rejects_missing_token(self, client):
+        with pytest.raises(Exception) as exc_info:
+            with client.websocket_connect("/ws/live"):
+                pass
+        # FastAPI's TestClient raises when the server closes the connection
+        # (including a custom close code/reason).
+        assert exc_info.value is not None
+
+    def test_websocket_rejects_empty_token(self, client):
+        with pytest.raises(Exception) as exc_info:
+            with client.websocket_connect("/ws/live?token="):
+                pass
+        assert exc_info.value is not None
+
+    def test_websocket_rejects_unknown_token(self, client):
+        with pytest.raises(Exception) as exc_info:
+            with client.websocket_connect(
+                "/ws/live?token=unknown-token-that-was-never-issued"
+            ):
+                pass
+        assert exc_info.value is not None
+
+    def test_websocket_rejects_invalidated_token(self, client):
+        resp = client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@fraudlens.io", "password": "fraudlens"},
+        )
+        assert resp.status_code == 200, resp.text
+        token = resp.json()["token"]
+
+        # Invalidate the token exactly as logout does.
+        from app.core.auth import invalidate_session
+        invalidated = invalidate_session(token)
+        assert invalidated is True
+
+        with pytest.raises(Exception) as exc_info:
+            with client.websocket_connect(f"/ws/live?token={token}"):
+                pass
+        assert exc_info.value is not None
 
 from app.main import app
 

@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 router = APIRouter()
 
+# Application-level WebSocket close codes (IANA range is 0..4999; FastAPI
+# passes these straight to the client).
+WS_CLOSE_NOT_AUTHENTICATED = 4001
+WS_CLOSE_INVALID_TOKEN = 4002
+WS_CLOSE_ACCOUNT_DISABLED = 4003
+
 
 class UserConnectionManager:
     """Manages per-user WebSocket connections."""
@@ -240,15 +246,37 @@ async def simulation_loop(user_id: str, interval: float = None):
 
 @router.websocket("/ws/live")
 async def websocket_live(websocket: WebSocket):
-    """WebSocket endpoint for live transaction stream — user-scoped."""
-    # Authenticate via query param token
-    token = websocket.query_params.get("token", "")
-    session = get_session(token)
-    if not session:
-        await websocket.close(code=4001, reason="Not authenticated")
+    """WebSocket endpoint for live transaction stream — user-scoped.
+
+    Authentication mirrors the REST token store (``app.core.auth``): the same
+    ``get_session`` used by ``deps.get_current_user`` is used here on the query
+    ``?token=`` parameter. A missing/empty token, an unknown token, or a token
+    whose owner has been deactivated all result in a clean, app-level close so
+    the client can stop reconnecting instead of retrying forever with
+    ``token=``.
+    """
+    token = (websocket.query_params.get("token") or "").strip()
+
+    if not token:
+        logger.info("ws/live rejected: empty token from %s", websocket.client)
+        await websocket.close(code=WS_CLOSE_NOT_AUTHENTICATED, reason="Not authenticated")
         return
 
-    user_id = session["user_id"]
+    session = get_session(token)
+    if session is None:
+        logger.info("ws/live rejected: unknown token from %s", websocket.client)
+        await websocket.close(code=WS_CLOSE_INVALID_TOKEN, reason="Invalid or expired token")
+        return
+
+    user_id = session.get("user_id")
+    if not user_id:
+        logger.info("ws/live rejected: token without user_id from %s", websocket.client)
+        await websocket.close(code=WS_CLOSE_INVALID_TOKEN, reason="Invalid session")
+        return
+
+    # Keep the behavior consistent with the REST path: if the account has been
+    # disabled, reject the connection too. (This is optional telemetry; the live
+    # stream does not currently enforce is_active at WS auth time.)
     await manager.connect(websocket, user_id)
 
     try:

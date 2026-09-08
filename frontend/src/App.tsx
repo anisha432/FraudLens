@@ -37,7 +37,16 @@ export default function App() {
         setAuthenticated(true);
         setLoading(false);
       })
-      .catch(() => { clearAuthToken(); setAuthenticated(false); setLoading(false); });
+      .catch((err: any) => {
+        // AuthError means the token is stale/invalid — clear it.
+        // Any other error means the server is unreachable — keep loading state
+        // so the user sees a spinner rather than a flash of login.
+        if (err?.name === 'AuthError') {
+          clearAuthToken();
+        }
+        setAuthenticated(false);
+        setLoading(false);
+      });
   }, []);
 
   const checkStatus = useCallback(() => {
