@@ -63,7 +63,9 @@ export default function App() {
     clearAuthToken();
     setCurrentUser(null);
     setAuthenticated(false);
-    setSystemStatus(null);
+    // Keep systemStatus in place until the next authenticated session loads it.
+    // It is only used for optional UI hints (nav badge + optional banner), not
+    // for gating routes, so clearing it here is not required for correctness.
     setShowProfile(false);
   };
 
@@ -89,11 +91,15 @@ export default function App() {
     return <Login onAuthenticated={handleAuthenticated} onShowRegister={() => setAuthView('register')} />;
   }
 
+  // The "Detection Environment Ready" onboarding screen is a route-level view,
+  // not a global App gate. It must NOT block authenticated users from reaching
+  // /command when systemStatus has loaded. The route /onboarding is where the
+  // full onboarding flow (upload + training) lives; the global nav "New Analysis"
+  // button also points there.
+  //
+  // hasDataset is still derived from systemStatus purely for optional UI hints
+  // (e.g. the nav badge). It is NOT used to hide routes.
   const hasDataset = systemStatus?.hasDataset && systemStatus?.modelsLoaded > 0;
-
-  if (systemStatus !== null && !hasDataset) {
-    return <Onboarding onReady={() => { checkStatus(); }} />;
-  }
 
   return (
     <div className="app-layout">

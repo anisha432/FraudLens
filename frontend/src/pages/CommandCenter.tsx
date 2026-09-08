@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getDashboardSummary } from '../api';
+import { getDashboardSummary, getSystemStatus } from '../api';
 import type { LiveTransaction } from '../hooks/useWebSocket';
 
 interface Props {
@@ -15,6 +15,7 @@ interface Props {
 
 export default function CommandCenter({ ws }: Props) {
   const [summary, setSummary] = useState<any>(null);
+  const [systemStatus, setSystemStatus] = useState<any>(null);
   const [simRunning, setSimRunning] = useState(false);
   const navigate = useNavigate();
 
@@ -24,6 +25,12 @@ export default function CommandCenter({ ws }: Props) {
       getDashboardSummary().then(setSummary).catch(() => {});
     }, 10000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Load system status once so the optional onboarding banner can show when the
+  // family has no dataset yet. This is NOT a route gate — /command always renders.
+  useEffect(() => {
+    getSystemStatus().then(setSystemStatus).catch(() => {});
   }, []);
 
   // Track simulation state from WebSocket
@@ -55,6 +62,23 @@ export default function CommandCenter({ ws }: Props) {
 
   return (
     <div className="fade-in" style={{ height: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Optional onboarding banner when the family has no dataset yet.
+        This is a hint, not a gate — /command is always reachable. */}
+      {systemStatus !== null && !systemStatus?.hasDataset && !systemStatus?.modelsLoaded && (
+        <div style={{
+          margin: '0 0 8px', padding: '8px 12px', background: 'var(--accent-dim)',
+          border: '1px solid var(--accent)', borderRadius: 6, display: 'flex',
+          alignItems: 'center', justifyContent: 'space-between', gap: 12,
+        }}>
+          <div style={{ fontSize: 11, color: 'var(--accent)', fontWeight: 600 }}>
+            No dataset loaded — upload one to enable detection.
+          </div>
+          <button className="btn btn-sm" style={{ fontSize: 10 }} onClick={() => navigate('/onboarding')}>
+            Setup Dataset
+          </button>
+        </div>
+      )}
+
       {/* Header Bar */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
